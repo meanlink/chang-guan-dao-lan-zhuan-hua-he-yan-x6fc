@@ -13,12 +13,28 @@ def listing(db=Depends(get_db),u=Depends(current_user)):
     return [job_dict(j) for j in db.scalars(select(Job).order_by(Job.id.desc()).limit(100))]
 @router.post('',status_code=201)
 def create(data:JobInput,db=Depends(get_db),u=Depends(can_write)):
-    j=jobs.create(db,data,u); record(db,u.email,'job.create',{'id':j.id,'params':j.params})
-    db.commit(); jobs.enqueue(j.id); return job_dict(j)
+    j, reused = jobs.create(db,data,u)
+    if not reused:
+        record(db,u.email,'job.create',{'id':j.id,'params':j.params,'quota_units':j.quota_units})
+        db.commit(); jobs.enqueue(j.id)
+    # 幂等重试命中已有任务时直接返回，不重复建单、不重复入队、不重复扣额
+    return job_dict(j)
 @router.get('/{id}')
 def detail(id:int,db=Depends(get_db),u=Depends(current_user)):
     j=db.get(Job,id)
     if not j: raise HTTPException(404,'分析任务不存在')
+    return job_dict(j)
+@router.post('/{id}/cancel')
+def cancel(id:int,db=Depends(get_db),u=Depends(can_write)):
+    j=db.get(Job,id)
+    if not j: raise HTTPException(404,'分析任务不存在')
+    ok=jobs.cancel(db,j,u)
+    if not ok:
+        # 重复取消或任务已结束：幂等返回当前状态，不重复退还
+        db.rollback()
+        return job_dict(db.get(Job,id))
+    record(db,u.email,'job.cancel',{'id':id,'quota_units':j.quota_units})
+    db.commit()
     return job_dict(j)
 @router.post('/{id}/approve')
 def approve(id:int,db=Depends(get_db),u=Depends(admin_only)):
